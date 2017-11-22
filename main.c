@@ -99,8 +99,9 @@ int call_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint64
 int MESI_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint64_t now_cycle);
 int Dragon_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint64_t now_cycle);
 int MESIF_FSM(int cpu_id, uint32_t address, cache_block *block_ptr, int event, uint64_t now_cycle);
+void Core_main(int i);
 
-int Bus_main(bus_res *bus_ptr);
+void Bus_main(void);
 int Bus_check_share(uint32_t address,uint8_t cpu[4]);
 int Bus_share_signal=0;
 int Bus_forward_signal=0;
@@ -132,8 +133,9 @@ int MESI_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint64
 					//BusRdX
 					Bus_req_generate(cpu_id,address,BusRdX);
 					block_ptr->state=Modified;
+					block_ptr->tag=address&tag_mask;
 					block_ptr->timestamp=now_cycle;
-					return 0;
+					return Bus_share_signal;
 					break;
 				}
 				case PrRd:{
@@ -146,6 +148,7 @@ int MESI_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint64
 						block_ptr->state=Exclusive;
 					}
 					block_ptr->timestamp=now_cycle;
+					block_ptr->tag=address&tag_mask;
 					return Bus_share_signal;
 
 					break;
@@ -179,10 +182,7 @@ int MESI_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint64
 					block_ptr->state=Invalid;
 					break;
 				}
-				default:{
-					fprintf(stderr,"error event in state Shared!\n");
-					exit(1);
-				}
+				
 			}
 			break;
 		}
@@ -247,7 +247,7 @@ int Dragon_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint
 {
 	switch (block_ptr->state)
 	{
-		case Invalid://when set is full ,invalid one and excute replace
+		case Invalid://when set is full ,invalid one and execute replace
 		{
 			switch (event)
 			{
@@ -261,6 +261,7 @@ int Dragon_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint
 						block_ptr->state=Exclusive;
 					}
 					block_ptr->timestamp=now_cycle;
+					block_ptr->tag=address&tag_mask;
 					return Bus_share_signal;
 					break;
 				}
@@ -276,6 +277,7 @@ int Dragon_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint
 						block_ptr->state=Modified;
 					}
 					block_ptr->timestamp=now_cycle;
+					block_ptr->tag=address&tag_mask;
 					return Bus_share_signal;
 					break;
 				}
@@ -392,7 +394,7 @@ int MESIF_FSM(int cpu_id, uint32_t address, cache_block *block_ptr, int event, u
 				case PrWr:{
 					// PrWr|BusRdX
 					Bus_req_generate(cpu_id, address, BusRdX);
-
+					block_ptr->tag=address&tag_mask;
 					block_ptr->state = Modified;
 					block_ptr->timestamp = now_cycle;
 					return 0;
@@ -411,6 +413,7 @@ int MESIF_FSM(int cpu_id, uint32_t address, cache_block *block_ptr, int event, u
 						block_ptr->state = Exclusive;
 					}
 
+					block_ptr->tag=address&tag_mask;
 					block_ptr->timestamp = now_cycle;
 					return Bus_share_signal;
 				}
@@ -567,7 +570,7 @@ void Core_main(int i)//change cpu_status, may change core_finish
 	{
 		core_finish[i]=1;
 		cpu_status[i].core_cycle--;//no need this cycle
-		continue;
+		return;
 	}
 	switch (ins_type){
 		case 0:{
@@ -580,13 +583,13 @@ void Core_main(int i)//change cpu_status, may change core_finish
 			{
 				cpu_status[i].miss_count++;
 				in_set_index=Cache_choose_replace(cache_core[i][my_set]);
-				this_block=&cache_set[i][my_set][in_set_index];
+				this_block=&cache_core[i][my_set][in_set_index];
 				if(this_block->state!=Invalid){//kick out
 					Bus_req_generate(i,ins_address,Flush);	
 					this_block->state=Invalid;
 				}
 			}
-			this_block=&cache_set[i][my_set][in_set_index];
+			this_block=&cache_core[i][my_set][in_set_index];
 			//check share
 			Bus_share_signal=0;
 			Bus_forward_signal=0;
@@ -614,22 +617,22 @@ void Core_main(int i)//change cpu_status, may change core_finish
 			{
 				cpu_status[i].miss_count++;
 				in_set_index=Cache_choose_replace(cache_core[i][my_set]);
-				this_block=&cache_set[i][my_set][in_set_index];
+				this_block=&cache_core[i][my_set][in_set_index];
 				if(this_block->state!=Invalid){//kick out
 					Bus_req_generate(i,ins_address,Flush);	
 					this_block->state=Invalid;
 				}
 			}
-			this_block=&cache_set[i][my_set][in_set_index];
+			this_block=&cache_core[i][my_set][in_set_index];
 			//check share
 			Bus_share_signal=0;
-			Bus_forward_signal=1;
+			Bus_forward_signal=0;
 			uint8_t share_cpu_id[4]={0};
 			if(Bus_check_share(ins_address,share_cpu_id))
 				Bus_share_signal=1;
-			if(Bus_forward_signal(ins_address))
+			if(Bus_check_forward(ins_address))
 				Bus_forward_signal=1;
-
+			
 			int access_res=call_FSM(i,ins_address,this_block,PrWr,cpu_status[i].core_cycle);
 			//0 for access private,1 access for shared
 			if(access_res==0)
@@ -650,14 +653,15 @@ void Bus_main()//change bus_status, may change cpu_status
 {
 	int i;
 	node_t* bus_queue_ptr=&bus_status.bus_queue;
-	if(is_empty(bus_queue_ptr)){
+	bus_req * head_req_ptr=peek(bus_queue_ptr);
+	if(head_req_ptr==NULL){
 		for(i=0;i<4;i++)
 			cpu_status[i].is_waiting_bus=0;
 		return;
 	}
+
 	if(bus_status.head_remain_cycle==0){
 		//start a new request
-		bus_req * head_req_ptr=peek(bus_queue_ptr);
 		bus_status.head_remain_cycle=head_req_ptr->estimate_cycle;
 		bus_status.traffic_bytes+=head_req_ptr->traffic_bytes;
 		if(head_req_ptr->request_type==BusRdX || head_req_ptr->request_type==BusUpd)
@@ -680,25 +684,27 @@ void Bus_main()//change bus_status, may change cpu_status
 			if(share_cpu_id[i] && head_req_ptr->cpu_id != i)//other cores involved
 			{
 				int in_set_index=Cache_check_hit(cache_core[i][my_set],ins_address);
-				cache_block* this_block=&cache_set[i][my_set][in_set_index];
+				cache_block* this_block=&cache_core[i][my_set][in_set_index];
 				call_FSM(i,ins_address,this_block,head_req_ptr->request_type,cpu_status[i].core_cycle);
 			}
 		}
-		//check new status for bus waiting
-		for(i=0;i<4;i++)
-			cpu_status[i].is_waiting_bus=0;
-		head_req_ptr=peek(bus_queue_ptr);
-		while(head_req_ptr!=bus_queue_ptr)
-		{
-			cpu_status[head_req_ptr->cpu_id].is_waiting_bus=1;
-			head_req_ptr=((node_t*)head_req_ptr)->next;
-		}
-		
 	}
 	else{
 		bus_status.head_remain_cycle--;
 		if(bus_status.head_remain_cycle==0)
 			free(dequeue(bus_queue_ptr));
+	}
+
+	//check status for bus waiting
+	for(i=0;i<4;i++)
+		cpu_status[i].is_waiting_bus=0;
+	head_req_ptr=peek(bus_queue_ptr);
+	if(head_req_ptr==NULL)
+		return;
+	while(head_req_ptr!=bus_queue_ptr)
+	{
+		cpu_status[head_req_ptr->cpu_id].is_waiting_bus=1;
+		head_req_ptr=((node_t*)head_req_ptr)->next;
 	}
 
 }
@@ -720,12 +726,13 @@ int Bus_check_share(uint32_t address,uint8_t cpu[4])
 {
 	int i,j;
 	int len=0;
+	uint32_t my_tag=address&tag_mask;
 	for(i=0;i<4;i++){
 		cache_block* set_ptr=cache_core[i][(address&set_mask)>>block_offset];
 		cpu[i]=0;
 		for(j=0;j<associativity;j++)
 		{
-			if(address&tag_mask==set_ptr[j].tag && set_ptr[j].state!=Invalid)
+			if( my_tag==set_ptr[j].tag && set_ptr[j].state!=Invalid)
 			{
 				cpu[i]=1;
 				len++;
@@ -754,7 +761,7 @@ int Cache_check_hit(cache_block* set,uint32_t address)
 	uint32_t my_tag=address&tag_mask;
 	for(i=0;i<associativity;i++)
 	{
-		if(set[i].tag==my_tag)//hit
+		if(set[i].tag==my_tag && set[i].state!= Invalid)//hit
 			return i;
 	}
 	return -1;
@@ -781,9 +788,9 @@ int Cache_choose_replace(cache_block* set)
 
 int main(int argc, char const *argv[])
 {
-	srand(time());
+	srand(time(NULL));
 
-	if(argc!=6 != argc!=3)
+	if(argc!=6 && argc!=3)
 	{
 		printf("wrong arguments!\n");
 		return 0;
@@ -793,7 +800,7 @@ int main(int argc, char const *argv[])
 	for (i = 0; i < 4; ++i)
 	{
 		char buffer[64];
-		sprintf(buffer,"%s_%d",argv[2],i);
+		sprintf(buffer,"%s_%d.data",argv[2],i);
 		trace_fp[i]=fopen(buffer,"r");
 	}
 	//determine protocol
@@ -812,6 +819,7 @@ int main(int argc, char const *argv[])
 		associativity=atoi(argv[4]);
 		block_size=atoi(argv[5]);
 		block_offset=0;
+		set_index_len=0;
 		uint32_t temp;
 		temp=block_size;
 		while(temp>>=1){
@@ -831,7 +839,7 @@ int main(int argc, char const *argv[])
 	{
 		cache_core[i]=malloc(set_number*sizeof(void*));
 		for(j=0;j<set_number;j++)
-			cache_core[i][j]=calloc(associativity*sizeof(cache_block));
+			cache_core[i][j]=calloc(associativity,sizeof(cache_block));
 	}
 	queue_init(&bus_status.bus_queue);
 	bus_status.head_remain_cycle=0;
@@ -843,7 +851,7 @@ int main(int argc, char const *argv[])
 	{
 
 		//first bus main
-
+		Bus_main();
 		//then core
 		int cpu_index[4]={0,1,2,3};
 		int temp;
@@ -874,6 +882,32 @@ int main(int argc, char const *argv[])
 		free(cache_core[i]);
 	}
 	//output result
+	uint64_t max_exec_cycle=0;
+	for(i=0;i<4;i++)
+		if(cpu_status[i].core_cycle>max_exec_cycle)
+			max_exec_cycle=cpu_status[i].core_cycle;
+	printf("Overall execution cycle: %llu\n",max_exec_cycle);
+	for(i=0;i<4;i++)
+		printf("Core %d execution cycle: %llu\n",i,cpu_status[i].core_cycle);
+	for(i=0;i<4;i++)
+		printf("Core %d compute cycle: %llu\n",i,cpu_status[i].compute_cycle);
+	for(i=0;i<4;i++)
+		printf("Core %d load/store ins number: %u\n",i,cpu_status[i].ls_ins);
+	for(i=0;i<4;i++)
+		printf("Core %d data cache miss rate: %.4f\n",i,((float)(cpu_status[i].miss_count) / (float)(cpu_status[i].ls_ins)) );
+	printf("Amount of data traffic in bytes on the bus: %u\n",bus_status.traffic_bytes);
+	printf("number of invalidation/updates on the bus: %u\n",bus_status.number_of_iu);
+	
+	uint32_t total_access_private=0,total_access_shared=0;
+	for(i=0;i<4;i++)
+	{
+		total_access_private+=cpu_status[i].access_private;
+		total_access_shared+=cpu_status[i].access_shared;
+	}
+	printf("Distribution of access to private/shared data: %.4f : %.4f\n",\
+		((float)(total_access_private) / (float)(total_access_private+total_access_shared)),\
+		((float)(total_access_shared) / (float)(total_access_private+total_access_shared)) );
+	
 
 	return 0;
 }
