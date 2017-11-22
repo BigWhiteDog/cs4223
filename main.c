@@ -749,7 +749,7 @@ int Bus_check_forward(uint32_t address)
 		cache_block* set_ptr=cache_core[i][(address&set_mask)>>block_offset];
 		for(j=0;j<associativity;j++)
 		{
-			if(set_ptr->state==Forward)
+			if(set_ptr->state==Forward || set_ptr->state==Exclusive)
 				return 1;
 		}
 	}
