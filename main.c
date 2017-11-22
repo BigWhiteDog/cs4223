@@ -9,7 +9,7 @@
 
 #include "queue.h"
 
-//MESI 1, Dragon 2, MESI_adv 3
+//MESI 1, Dragon 2, MESIF 3
 int protocol=0;
 
 FILE *trace_fp[4];
@@ -29,9 +29,11 @@ enum{
 	Shared,
 	Modified,
 	Exclusive,
+	Forward,
 	Sc,
 	Sm
 };
+
 //event
 enum{
 	Nothing=0,
@@ -40,7 +42,8 @@ enum{
 	BusRd,//bus read S' use BusRd_
 	BusRdX,
 	BusUpd,
-	Flush
+	Flush,
+	BusRdC//bus read from another cache
 };
 
 typedef struct
@@ -95,11 +98,12 @@ int core_finish[4]={0};
 int call_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint64_t now_cycle);
 int MESI_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint64_t now_cycle);
 int Dragon_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint64_t now_cycle);
-int MESI_adv_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint64_t now_cycle);
+int MESIF_FSM(int cpu_id, uint32_t address, cache_block *block_ptr, int event, uint64_t now_cycle);
 
 int Bus_main(bus_res *bus_ptr);
 int Bus_check_share(uint32_t address,uint8_t cpu[4]);
 int Bus_share_signal=0;
+int Bus_forward_signal=0;
 void Bus_req_generate(int cpu_id,uint32_t address,int request_type);
 
 int Cache_check_hit(cache_block* set,uint32_t address);//return -1 if miss, return index in set if hit
@@ -112,7 +116,7 @@ int call_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint64
 	switch (protocol){
 		case 1:return MESI_FSM(cpu_id,address,block_ptr,event,now_cycle);
 		case 2:return Dragon_FSM(cpu_id,address,block_ptr,event,now_cycle);
-		case 3:return MESI_adv_FSM(cpu_id,address,block_ptr,event,now_cycle);
+		case 3:return MESIF_FSM(cpu_id,address,block_ptr,event,now_cycle);
 		default: assert(protocol);
 	}
 }
@@ -187,6 +191,7 @@ int MESI_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint64
 			switch (event)
 			{
 				case PrWr:{
+					block_ptr->state = Modified;
 					block_ptr->timestamp=now_cycle;
 					return 0;
 					break;
@@ -362,7 +367,7 @@ int Dragon_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint
 				}
 				case BusRd:{
 					block_ptr->state=Sm;
-					//flush, work the same time as busrd
+					//flush, work the same time as read
 					break;
 				}
 				case BusUpd:{//error
@@ -376,7 +381,7 @@ int Dragon_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint
 	}
 	return -1;
 }
-int MESI_adv_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,uint64_t now_cycle)
+int MESIF_FSM(int cpu_id, uint32_t address, cache_block *block_ptr, int event, uint64_t now_cycle)
 {
 	switch (block_ptr->state)
 	{
@@ -385,20 +390,32 @@ int MESI_adv_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,ui
 			switch (event)
 			{
 				case PrWr:{
-					break;
+					// PrWr|BusRdX
+					Bus_req_generate(cpu_id, address, BusRdX);
+
+					block_ptr->state = Modified;
+					block_ptr->timestamp = now_cycle;
+					return 0;
 				}
 				case PrRd:{
-					break;
+					// PrRd|BusRd(S')
+					if (Bus_forward_signal) {
+						Bus_req_generate(cpu_id, address, BusRdC);
+					} else{
+						Bus_req_generate(cpu_id, address, BusRdX);
+					}
+
+					if (Bus_share_signal){
+						block_ptr->state = Forward;
+					} else {
+						block_ptr->state = Exclusive;
+					}
+
+					block_ptr->timestamp = now_cycle;
+					return Bus_share_signal;
 				}
-				case BusRd:{
+				default:
 					break;
-				}
-				case BusRd_:{
-					break;
-				}
-				case BusRdX:{
-					break;
-				}
 			}
 			break;
 		}
@@ -407,18 +424,29 @@ int MESI_adv_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,ui
 			switch (event)
 			{
 				case PrWr:{
-					break;
+					// PrWr|BusRdX
+					Bus_req_generate(cpu_id, address, BusRdX);
+
+					block_ptr->state = Modified;
+					block_ptr->timestamp = now_cycle;
+					return 1;
 				}
 				case PrRd:{
-					break;
+					// PrRd|_
+					block_ptr->timestamp = now_cycle;
+					return 1;
 				}
 				case BusRd:{
-					break;
-				}
-				case BusRd_:{
+					// BusRd|_
 					break;
 				}
 				case BusRdX:{
+					// BusRdX|_
+					block_ptr->state = Invalid;
+					break;
+				}
+				case BusRdC:{
+					// BusRdC|_
 					break;
 				}
 			}
@@ -429,18 +457,25 @@ int MESI_adv_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,ui
 			switch (event)
 			{
 				case PrWr:{
+					// PrWr|_
+					block_ptr->state = Modified;
+					block_ptr->timestamp = now_cycle;
+					return 0;
+
 					break;
 				}
 				case PrRd:{
-					break;
+					// PrRd|_
+					block_ptr->timestamp = now_cycle;
+					return 0;
 				}
 				case BusRd:{
-					break;
-				}
-				case BusRd_:{
+					block_ptr->state = Shared;
 					break;
 				}
 				case BusRdX:{
+					// BusRdX|_
+					block_ptr->state = Invalid;
 					break;
 				}
 			}
@@ -451,24 +486,64 @@ int MESI_adv_FSM(int cpu_id,uint32_t address,cache_block *block_ptr,int event,ui
 			switch (event)
 			{
 				case PrWr:{
-					break;
+					// PrWr|_
+					block_ptr->timestamp = now_cycle;
+					return 0;
 				}
 				case PrRd:{
-					break;
+					// PrRd|_
+					block_ptr->timestamp = now_cycle;
+					return 0;
 				}
 				case BusRd:{
-					break;
-				}
-				case BusRd_:{
+					// BusRd|Flush
+					block_ptr->state = Shared;
+					//flush,but act the same time when read
 					break;
 				}
 				case BusRdX:{
+					// BusRdX|Flush
+					block_ptr->state = Invalid;
+					//flush,but act the same time when readX
+					break;
+				}
+			}
+			break;
+		}
+		case Forward:
+		{
+			switch (event)
+			{
+				case PrWr:{
+					// PrWr|BusRdX
+					Bus_req_generate(cpu_id, address, BusRdX);
+
+					block_ptr->state = Modified;
+					block_ptr->timestamp = now_cycle;
+					return 1;
+				}
+				case PrRd:{
+					// PrRd|_
+					block_ptr->timestamp = now_cycle;
+					return 1;
+				}
+				case BusRd:{
+					// BusRd|Supply
+					block_ptr->state = Shared;
+					block_ptr->timestamp = now_cycle;
+					//supply,but act the same time when readC
+					break;
+				}
+				case BusRdX:{
+					// BusRdX|_
+					block_ptr->state = Invalid;
 					break;
 				}
 			}
 			break;
 		}
 	}
+	return -1;
 }
 void Core_main(int i)//change cpu_status, may change core_finish
 {
@@ -513,11 +588,14 @@ void Core_main(int i)//change cpu_status, may change core_finish
 			}
 			this_block=&cache_set[i][my_set][in_set_index];
 			//check share
-			Bus_share_signal=0;		
+			Bus_share_signal=0;
+			Bus_forward_signal=0;
 			uint8_t share_cpu_id[4]={0};
 			if(Bus_check_share(ins_address,share_cpu_id))
 				Bus_share_signal=1;
-			
+			if(Bus_check_forward(ins_address))
+				Bus_forward_signal=1;
+
 			int access_res=call_FSM(i,ins_address,this_block,PrRd,cpu_status[i].core_cycle);
 			//0 for access private,1 access for shared
 			if(access_res==0)
@@ -544,11 +622,14 @@ void Core_main(int i)//change cpu_status, may change core_finish
 			}
 			this_block=&cache_set[i][my_set][in_set_index];
 			//check share
-			Bus_share_signal=0;		
+			Bus_share_signal=0;
+			Bus_forward_signal=1;
 			uint8_t share_cpu_id[4]={0};
 			if(Bus_check_share(ins_address,share_cpu_id))
 				Bus_share_signal=1;
-			
+			if(Bus_forward_signal(ins_address))
+				Bus_forward_signal=1;
+
 			int access_res=call_FSM(i,ins_address,this_block,PrWr,cpu_status[i].core_cycle);
 			//0 for access private,1 access for shared
 			if(access_res==0)
@@ -584,10 +665,13 @@ void Bus_main()//change bus_status, may change cpu_status
 		//handle snoop protocol
 		uint32_t ins_address=head_req_ptr->address;
 		//check share
-		Bus_share_signal=0;		
+		Bus_share_signal=0;
+		Bus_forward_signal=0;
 		uint8_t share_cpu_id[4]={0};
 		if(Bus_check_share(ins_address,share_cpu_id))
 			Bus_share_signal=1;
+		if(Bus_check_forward(ins_address))
+			Bus_forward_signal=1;
 
 		uint32_t my_set=ins_address&set_mask;
 		my_set>>=block_offset;
@@ -626,7 +710,7 @@ void Bus_req_generate(int cpu_id,uint32_t address,int request_type)
 	new_req_ptr->request_type=request_type;
 	new_req_ptr->address=address&no_offset_mask;//get rid of offset
 	new_req_ptr->traffic_bytes=block_size;
-	if(request_type==BusUpd)
+	if(request_type==BusUpd || request_type==BusRdC)
 		new_req_ptr->estimate_cycle=new_req_ptr->traffic_bytes/4*2;
 	else if(request_type!=Nothing)
 		new_req_ptr->estimate_cycle=100;
@@ -641,7 +725,7 @@ int Bus_check_share(uint32_t address,uint8_t cpu[4])
 		cpu[i]=0;
 		for(j=0;j<associativity;j++)
 		{
-			if( address&tag_mask==set_ptr[j].tag && set_ptr[j].state!=Invalid)
+			if(address&tag_mask==set_ptr[j].tag && set_ptr[j].state!=Invalid)
 			{
 				cpu[i]=1;
 				len++;
@@ -650,6 +734,19 @@ int Bus_check_share(uint32_t address,uint8_t cpu[4])
 		}
 	}
 	return len;
+}
+int Bus_check_forward(uint32_t address)
+{
+	int i,j;
+	for(i=0;i<4;i++){
+		cache_block* set_ptr=cache_core[i][(address&set_mask)>>block_offset];
+		for(j=0;j<associativity;j++)
+		{
+			if(set_ptr->state==Forward)
+				return 1;
+		}
+	}
+	return 0;
 }
 int Cache_check_hit(cache_block* set,uint32_t address)
 {
@@ -686,7 +783,7 @@ int main(int argc, char const *argv[])
 {
 	srand(time());
 
-	if(argc!=6 || argc!=3)
+	if(argc!=6 != argc!=3)
 	{
 		printf("wrong arguments!\n");
 		return 0;
@@ -704,7 +801,7 @@ int main(int argc, char const *argv[])
 		protocol=1;
 	else if(strcmp("Dragon",argv[1])==0)
 		protocol=2;
-	else if(strcmp("MESI_adv",argv[1])==0)
+	else if(strcmp("MESIF",argv[1])==0)
 		protocol=3;
 	else
 		exit(1);
