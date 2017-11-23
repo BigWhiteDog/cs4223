@@ -894,6 +894,8 @@ int main(int argc, char const *argv[])
 	for(i=0;i<4;i++)
 		printf("Core %d load/store ins number: %u\n",i,cpu_status[i].ls_ins);
 	for(i=0;i<4;i++)
+		printf("Core %d load/store ins number: %llu\n",i,cpu_status[i].idle_cycle);
+	for(i=0;i<4;i++)
 		printf("Core %d data cache miss rate: %.4f\n",i,((float)(cpu_status[i].miss_count) / (float)(cpu_status[i].ls_ins)) );
 	printf("Amount of data traffic in bytes on the bus: %u\n",bus_status.traffic_bytes);
 	printf("number of invalidation/updates on the bus: %u\n",bus_status.number_of_iu);
