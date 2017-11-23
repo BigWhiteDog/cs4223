@@ -404,7 +404,7 @@ int MESIF_FSM(int cpu_id, uint32_t address, cache_block *block_ptr, int event, u
 					if (Bus_forward_signal) {
 						Bus_req_generate(cpu_id, address, BusRdC);
 					} else{
-						Bus_req_generate(cpu_id, address, BusRdX);
+						Bus_req_generate(cpu_id, address, BusRd);
 					}
 
 					if (Bus_share_signal){
